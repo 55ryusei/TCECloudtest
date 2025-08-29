@@ -30,30 +30,41 @@ class TimecardFirebaseSync {
     this.setupNetworkListeners();
   }
 
-  // 認証初期化
-  async initializeAuth() {
-    auth.onAuthStateChanged(async (user) => {
-      this.currentUser = user;
-      if (user) {
-        console.log('ユーザーログイン:', user.uid);
-        await this.syncWithCloud();
-        this.setupRealtimeListener();
-      } else {
-        console.log('匿名認証を開始...');
-        await this.signInAnonymously();
-      }
-    });
+class TimecardFirebaseSync {
+  constructor() {
+    this.STORAGE_KEY = 'timeCards';
+    this.isOnline = navigator.onLine;
+    this.syncQueue = [];
+    this.currentUser = null;
+    
+    this.initializeAuth();
+    this.setupNetworkListeners();
   }
 
-  // 匿名認証
-  async signInAnonymously() {
+  // 認証初期化（シンプル固定アカウント版）
+  async initializeAuth() {
     try {
-      const result = await auth.signInAnonymously();
-      console.log('匿名ユーザーとしてサインイン:', result.user.uid);
+      // 固定の会社アカウント情報
+      const MASTER_EMAIL = "timecard-master@yourcompany.com";
+      const MASTER_PASSWORD = "TimeCard2025!";
+      
+      await auth.signInWithEmailAndPassword(MASTER_EMAIL, MASTER_PASSWORD);
+      
+      auth.onAuthStateChanged(async (user) => {
+        this.currentUser = user;
+        if (user) {
+          console.log('マスターアカウントにログイン:', user.email);
+          await this.syncWithCloud();
+          this.setupRealtimeListener();
+        }
+      });
     } catch (error) {
-      console.error('匿名認証エラー:', error);
+      console.error('認証エラー:', error);
+      console.log('マスターアカウントの作成が必要です');
     }
   }
+
+  // 匿名認証を削除（不要）
 
   // ネットワーク状態監視
   setupNetworkListeners() {
@@ -88,9 +99,28 @@ class TimecardFirebaseSync {
   // クラウドデータとローカルデータのマージ
   mergeCloudData(cloudData) {
     const localData = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
-    const mergedData = this.deepMergeTimeCards(localData, cloudData);
+    const cloudDeletedRecords = cloudData.deletedRecords || [];
+    const mergedData = this.deepMergeTimeCards(localData, cloudData.records || {});
+    
+    // 削除ログを適用
+    this.applyDeletions(mergedData, cloudDeletedRecords);
     
     localStorage.setItem(this.STORAGE_KEY, JSON.stringify(mergedData));
+    
+    // 削除ログもマージ
+    const localDeletedRecords = JSON.parse(localStorage.getItem('deletedRecords') || '[]');
+    const allDeletedRecords = [...localDeletedRecords];
+    
+    cloudDeletedRecords.forEach(cloudDeleted => {
+      const exists = allDeletedRecords.some(localDeleted => 
+        localDeleted.id === cloudDeleted.id
+      );
+      if (!exists) {
+        allDeletedRecords.push(cloudDeleted);
+      }
+    });
+    
+    localStorage.setItem('deletedRecords', JSON.stringify(allDeletedRecords));
     
     // UIの更新
     if (typeof displayEmpRecords === 'function') {
@@ -98,6 +128,33 @@ class TimecardFirebaseSync {
     }
     
     console.log('データマージ完了');
+  }
+
+  // 削除ログを適用
+  applyDeletions(data, deletedRecords) {
+    deletedRecords.forEach(deleted => {
+      if (data[deleted.name] && data[deleted.name][deleted.date]) {
+        data[deleted.name][deleted.date] = data[deleted.name][deleted.date].filter(record => {
+          // IDまたは時間で削除対象を特定
+          const matchById = deleted.id && record.id === deleted.id;
+          const matchByTime = !deleted.id && 
+            record.checkIn === deleted.checkIn && 
+            record.checkOut === deleted.checkOut;
+          
+          return !(matchById || matchByTime);
+        });
+        
+        // 空になった日付を削除
+        if (data[deleted.name][deleted.date].length === 0) {
+          delete data[deleted.name][deleted.date];
+        }
+      }
+      
+      // 空になった名前を削除
+      if (data[deleted.name] && Object.keys(data[deleted.name]).length === 0) {
+        delete data[deleted.name];
+      }
+    });
   }
 
   // タイムカードデータの深いマージ
@@ -149,10 +206,12 @@ class TimecardFirebaseSync {
     
     try {
       const localData = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
+      const deletedRecords = JSON.parse(localStorage.getItem('deletedRecords') || '[]');
       const userDoc = db.collection('timecards').doc(this.currentUser.uid);
       
       await userDoc.set({
         records: localData,
+        deletedRecords: deletedRecords,
         lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       
@@ -398,11 +457,26 @@ async function connectToSharedAccount(code) {
     
     // ローカルデータと統合
     const targetData = targetDoc.data().records || {};
+    const targetDeletedRecords = targetDoc.data().deletedRecords || [];
     const localData = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
     const mergedData = firebaseSync.deepMergeTimeCards(localData, targetData);
     
+    // 削除ログを適用
+    firebaseSync.applyDeletions(mergedData, targetDeletedRecords);
+    
     // ローカルに保存
     localStorage.setItem(STORAGE_KEY, JSON.stringify(mergedData));
+    
+    // 削除ログもマージ
+    const localDeletedRecords = JSON.parse(localStorage.getItem('deletedRecords') || '[]');
+    const allDeletedRecords = [...localDeletedRecords];
+    targetDeletedRecords.forEach(deleted => {
+      const exists = allDeletedRecords.some(local => local.id === deleted.id);
+      if (!exists) {
+        allDeletedRecords.push(deleted);
+      }
+    });
+    localStorage.setItem('deletedRecords', JSON.stringify(allDeletedRecords));
     
     // 共有アカウント設定を保存
     localStorage.setItem('sharedAccountId', targetUserId);
@@ -424,16 +498,19 @@ firebaseSync.syncWithSharedAccount = async function() {
   
   try {
     const localData = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
+    const deletedRecords = JSON.parse(localStorage.getItem('deletedRecords') || '[]');
     
     // 自分のアカウントに保存
     await db.collection('timecards').doc(this.currentUser.uid).set({
       records: localData,
+      deletedRecords: deletedRecords,
       lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
     
     // 共有アカウントにも保存
     await db.collection('timecards').doc(sharedAccountId).set({
       records: localData,
+      deletedRecords: deletedRecords,
       lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
     
@@ -732,11 +809,27 @@ function showConfirmDialog(message, onConfirm) {
   });
 }
 
-// 個別データ削除
-function deleteRecord(name, date, recordIndex) {
+// 個別データ削除（同期対応版）
+async function deleteRecord(name, date, recordIndex) {
   const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
   
   if (data[name] && data[name][date] && data[name][date][recordIndex]) {
+    const deletedRecord = data[name][date][recordIndex];
+    
+    // 削除記録を保存（他デバイスとの同期用）
+    let deletedRecords = JSON.parse(localStorage.getItem('deletedRecords') || '[]');
+    const deleteLog = {
+      id: deletedRecord.id || `${name}-${date}-${deletedRecord.checkIn}`,
+      name: name,
+      date: date,
+      checkIn: deletedRecord.checkIn,
+      checkOut: deletedRecord.checkOut,
+      deletedAt: new Date().toISOString()
+    };
+    deletedRecords.push(deleteLog);
+    localStorage.setItem('deletedRecords', JSON.stringify(deletedRecords));
+    
+    // ローカルから削除
     data[name][date].splice(recordIndex, 1);
     
     if (data[name][date].length === 0) {
@@ -748,6 +841,16 @@ function deleteRecord(name, date, recordIndex) {
     }
     
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    
+    // クラウド同期（削除ログも含める）
+    if (firebaseSync.currentUser) {
+      try {
+        await firebaseSync.syncWithCloud();
+      } catch (error) {
+        console.error('削除同期エラー:', error);
+      }
+    }
+    
     displayEmpRecords();
     updateButtons(document.getElementById('empName').value.trim());
     showAlert('記録を削除しました', 'success');
