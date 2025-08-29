@@ -152,6 +152,7 @@ class TimecardFirebaseSync {
       console.log('クラウド同期完了');
     } catch (error) {
       console.error('同期エラー:', error);
+      const localData = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
       this.syncQueue.push({ action: 'sync', data: localData });
     }
   }
