@@ -127,6 +127,13 @@ class TimecardFirebaseSync {
               }
             });
             
+            // 時間順にソート（出勤時間の昇順）
+            mergedRecords.sort((a, b) => {
+              const timeA = a.checkIn || '00:00';
+              const timeB = b.checkIn || '00:00';
+              return timeA.localeCompare(timeB);
+            });
+            
             merged[employeeName][date] = mergedRecords;
           }
         });
@@ -1130,9 +1137,22 @@ function displayEmpRecords() {
       
       Object.keys(data[name]).sort().reverse().forEach(date => {
         const records = data[name][date];
-        records.slice().reverse().forEach((rec, reverseIndex) => {
+        
+        // 同じ日の記録を時間順にソート（新しい順）
+        const sortedRecords = records.slice().sort((a, b) => {
+          const timeA = a.checkIn || '00:00';
+          const timeB = b.checkIn || '00:00';
+          return timeB.localeCompare(timeA); // 降順（新しい順）
+        });
+        
+        sortedRecords.forEach((rec, index) => {
           if (rec.checkIn) {
-            const recordIndex = records.length - 1 - reverseIndex;
+            // 元の配列での正しいインデックスを見つける
+            const recordIndex = records.findIndex(r => 
+              r.checkIn === rec.checkIn && 
+              r.checkOut === rec.checkOut && 
+              r.id === rec.id
+            );
             
             hasRecords = true;
             const div = document.createElement('div');
