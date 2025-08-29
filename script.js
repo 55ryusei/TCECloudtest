@@ -336,6 +336,113 @@ function playChord(audioContext, frequencies, volume = 0.3, duration = 0.2) {
   });
 }
 
+// クリップボードにコピー
+function copyToClipboard(code, message) {
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(code).then(() => {
+      showAlert(`共有コードをコピー: ${code}`, 'success');
+    }).catch(() => {
+      fallbackCopy(message);
+    });
+  } else {
+    fallbackCopy(message);
+  }
+}
+
+function fallbackCopy(text) {
+  const textArea = document.createElement('textarea');
+  textArea.value = text;
+  document.body.appendChild(textArea);
+  textArea.select();
+  try {
+    document.execCommand('copy');
+    showAlert('共有コードをコピーしました', 'success');
+  } catch (err) {
+    showAlert(`共有コード: ${text}`, 'info');
+  }
+  document.body.removeChild(textArea);
+}
+
+// 共有アカウントに接続
+async function connectToSharedAccount(code) {
+  try {
+    // コードからフルユーザーIDを検索
+    const snapshot = await db.collection('timecards').get();
+    let targetUserId = null;
+    
+    snapshot.forEach(doc => {
+      const userId = doc.id;
+      if (userId.substring(0, 8).toUpperCase() === code) {
+        targetUserId = userId;
+      }
+    });
+    
+    if (!targetUserId) {
+      showAlert('共有コードが見つかりません', 'error');
+      return;
+    }
+    
+    // 共有アカウントのデータを取得
+    const targetDoc = await db.collection('timecards').doc(targetUserId).get();
+    if (!targetDoc.exists) {
+      showAlert('データが存在しません', 'error');
+      return;
+    }
+    
+    // ローカルデータと統合
+    const targetData = targetDoc.data().records || {};
+    const localData = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    const mergedData = firebaseSync.deepMergeTimeCards(localData, targetData);
+    
+    // ローカルに保存
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(mergedData));
+    
+    // 共有アカウント設定を保存
+    localStorage.setItem('sharedAccountId', targetUserId);
+    
+    // UI更新
+    displayEmpRecords();
+    showAlert(`データを統合しました (${Object.keys(mergedData).length}名)`, 'success');
+    
+  } catch (error) {
+    console.error('共有アカウント接続エラー:', error);
+    showAlert('接続に失敗しました', 'error');
+  }
+}
+
+// Firebase同期クラスに共有アカウント同期を追加
+firebaseSync.syncWithSharedAccount = async function() {
+  const sharedAccountId = localStorage.getItem('sharedAccountId');
+  if (!sharedAccountId || !this.currentUser || !this.isOnline) return;
+  
+  try {
+    const localData = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
+    
+    // 自分のアカウントに保存
+    await db.collection('timecards').doc(this.currentUser.uid).set({
+      records: localData,
+      lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    
+    // 共有アカウントにも保存
+    await db.collection('timecards').doc(sharedAccountId).set({
+      records: localData,
+      lastUpdated: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    
+    console.log('共有アカウント同期完了');
+  } catch (error) {
+    console.error('共有アカウント同期エラー:', error);
+  }
+};
+
+// 元のsyncWithCloud関数を拡張
+const originalSyncWithCloud = firebaseSync.syncWithCloud.bind(firebaseSync);
+firebaseSync.syncWithCloud = async function() {
+  await originalSyncWithCloud();
+  await this.syncWithSharedAccount();
+};
+
 // 日本時間取得
 function getJstDate() {
   return new Date(new Date().toLocaleString("en-US", {timeZone: "Asia/Tokyo"}));
@@ -1264,6 +1371,41 @@ document.addEventListener('DOMContentLoaded', () => {
     } finally {
       syncBtn.disabled = false;
       syncBtn.textContent = 'クラウド同期';
+    }
+  });
+
+  // 共有コード生成ボタン
+  document.getElementById('generateCodeBtn').addEventListener('click', async () => {
+    if (!firebaseSync.currentUser) {
+      showAlert('認証が完了していません', 'error');
+      return;
+    }
+
+    const shareCode = firebaseSync.currentUser.uid.substring(0, 8).toUpperCase();
+    const message = `共有コード: ${shareCode}\n\n別デバイスで「共有コード入力」から入力してください。`;
+    
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: '勤怠管理 共有コード',
+          text: message
+        });
+        showAlert('共有コード送信済み', 'success');
+      } catch (error) {
+        if (!error.name.includes('Abort')) {
+          copyToClipboard(shareCode, message);
+        }
+      }
+    } else {
+      copyToClipboard(shareCode, message);
+    }
+  });
+
+  // 共有コード入力ボタン
+  document.getElementById('inputCodeBtn').addEventListener('click', () => {
+    const code = prompt('共有コードを入力してください:');
+    if (code) {
+      connectToSharedAccount(code.toUpperCase());
     }
   });
   
